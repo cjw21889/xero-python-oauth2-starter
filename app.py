@@ -7,7 +7,7 @@ from logging.config import dictConfig
 from flask import Flask, url_for, render_template, session, redirect, json, send_file
 from flask_oauthlib.contrib.client import OAuth, OAuth2Application
 from flask_session import Session
-from xero_python.accounting import AccountingApi, ContactPerson, Contact, Contacts
+from xero_python.accounting import AccountingApi
 from xero_python.api_client import ApiClient, serialize
 from xero_python.api_client.configuration import Configuration
 from xero_python.api_client.oauth2 import OAuth2Token
@@ -17,6 +17,9 @@ from xero_python.utils import getvalue
 
 import logging_settings
 from utils import jsonify, serialize_model
+import dateutil
+import pandas as pd
+import json
 
 dictConfig(logging_settings.default_settings)
 
@@ -24,6 +27,7 @@ dictConfig(logging_settings.default_settings)
 app = Flask(__name__)
 app.config.from_object("default_settings")
 app.config.from_pyfile("config.py", silent=True)
+print(app.config['CLIENT_ID'])
 
 if app.config["ENV"] != "production":
     # allow oauth2 loop to run over http (used for local testing only)
@@ -98,129 +102,6 @@ def index():
     )
 
 
-@app.route("/tenants")
-@xero_token_required
-def tenants():
-    identity_api = IdentityApi(api_client)
-    accounting_api = AccountingApi(api_client)
-
-    available_tenants = []
-    for connection in identity_api.get_connections():
-        tenant = serialize(connection)
-        if connection.tenant_type == "ORGANISATION":
-            organisations = accounting_api.get_organisations(
-                xero_tenant_id=connection.tenant_id
-            )
-            tenant["organisations"] = serialize(organisations)
-
-        available_tenants.append(tenant)
-
-    return render_template(
-        "code.html",
-        title="Xero Tenants",
-        code=json.dumps(available_tenants, sort_keys=True, indent=4),
-    )
-
-
-@app.route("/create-contact-person")
-@xero_token_required
-def create_contact_person():
-    xero_tenant_id = get_xero_tenant_id()
-    accounting_api = AccountingApi(api_client)
-
-    contact_person = ContactPerson(
-        first_name="John",
-        last_name="Smith",
-        email_address="john.smith@24locks.com",
-        include_in_emails=True,
-    )
-    contact = Contact(
-        name="FooBar",
-        first_name="Foo",
-        last_name="Bar",
-        email_address="ben.bowden@24locks.com",
-        contact_persons=[contact_person],
-    )
-    contacts = Contacts(contacts=[contact])
-    try:
-        created_contacts = accounting_api.create_contacts(
-            xero_tenant_id, contacts=contacts
-        )  # type: Contacts
-    except AccountingBadRequestException as exception:
-        sub_title = "Error: " + exception.reason
-        code = jsonify(exception.error_data)
-    else:
-        sub_title = "Contact {} created.".format(
-            getvalue(created_contacts, "contacts.0.name", "")
-        )
-        code = serialize_model(created_contacts)
-
-    return render_template(
-        "code.html", title="Create Contacts", code=code, sub_title=sub_title
-    )
-
-
-@app.route("/create-multiple-contacts")
-@xero_token_required
-def create_multiple_contacts():
-    xero_tenant_id = get_xero_tenant_id()
-    accounting_api = AccountingApi(api_client)
-
-    contact = Contact(
-        name="George Jetson",
-        first_name="George",
-        last_name="Jetson",
-        email_address="george.jetson@aol.com",
-    )
-    # Add the same contact twice - the first one will succeed, but the
-    # second contact will fail with a validation error which we'll show.
-    contacts = Contacts(contacts=[contact, contact])
-    try:
-        created_contacts = accounting_api.create_contacts(
-            xero_tenant_id, contacts=contacts, summarize_errors=False
-        )  # type: Contacts
-    except AccountingBadRequestException as exception:
-        sub_title = "Error: " + exception.reason
-        result_list = None
-        code = jsonify(exception.error_data)
-    else:
-        sub_title = ""
-        result_list = []
-        for contact in created_contacts.contacts:
-            if contact.has_validation_errors:
-                error = getvalue(contact.validation_errors, "0.message", "")
-                result_list.append("Error: {}".format(error))
-            else:
-                result_list.append("Contact {} created.".format(contact.name))
-
-        code = serialize_model(created_contacts)
-
-    return render_template(
-        "code.html",
-        title="Create Multiple Contacts",
-        code=code,
-        result_list=result_list,
-        sub_title=sub_title,
-    )
-
-
-@app.route("/invoices")
-@xero_token_required
-def get_invoices():
-    xero_tenant_id = get_xero_tenant_id()
-    accounting_api = AccountingApi(api_client)
-
-    invoices = accounting_api.get_invoices(
-        xero_tenant_id, statuses=["DRAFT", "SUBMITTED"]
-    )
-    code = serialize_model(invoices)
-    sub_title = "Total invoices found: {}".format(len(invoices.invoices))
-
-    return render_template(
-        "code.html", title="Invoices", code=code, sub_title=sub_title
-    )
-
-
 @app.route("/login")
 def login():
     redirect_url = url_for("oauth_callback", _external=True)
@@ -275,16 +156,282 @@ def refresh_token():
     )
 
 
-def get_xero_tenant_id():
+@app.route("/tenants")
+@xero_token_required
+def tenants():
+    identity_api = IdentityApi(api_client)
+    accounting_api = AccountingApi(api_client)
+
+    available_tenants = []
+    for connection in identity_api.get_connections():
+        tenant = serialize(connection)
+        if connection.tenant_type == "ORGANISATION":
+            organisations = accounting_api.get_organisations(
+                xero_tenant_id=connection.tenant_id
+            )
+            tenant["organisations"] = serialize(organisations)
+
+        available_tenants.append(tenant)
+    hotels=[]
+    for i in available_tenants:
+        org = i.get('organisations',{}).get('Organisations',[{}])[0]
+        if not org.get('IsDemoCompany', True):
+            hotels.append({'tenant_id': i.get('tenantId'),
+                        'name': i.get('tenantName'),
+                        'api_key': org.get('APIKey'),
+                        'currency': org.get('BaseCurrency'),
+                        'org_id': org.get('OrganisationID'),
+                        'org_status': org.get('OrganisationStatus'),
+            })
+    hotel_df = pd.DataFrame(hotels)
+    hotel_df.to_csv('tenants1.csv', index=False)
+
+    return render_template(
+        "code.html",
+        title="Xero Tenants",
+        code=hotel_df,
+        # code = available_tenants[0]['organisations']['Organisations'][0].keys()
+        # code=json.dumps(available_tenants, sort_keys=True, indent=4)
+    )
+
+
+def get_xero_tenant_id(hotel):
     token = obtain_xero_oauth2_token()
     if not token:
         return None
 
     identity_api = IdentityApi(api_client)
     for connection in identity_api.get_connections():
-        if connection.tenant_type == "ORGANISATION":
+        if connection.tenant_type == "ORGANISATION" and connection.tenant_name == hotel:
             return connection.tenant_id
 
 
+def get_hotels():
+    token = obtain_xero_oauth2_token()
+    if not token:
+        return None
+
+    identity_api = IdentityApi(api_client)
+    return {connection.tenant_name: connection.tenant_id for connection in identity_api.get_connections()}
+
+
+@app.route("/tracking")
+@xero_token_required
+def get_tracking_categories(hotel ,id):
+    accounting_api = AccountingApi(api_client)
+    params = {
+        'xero_tenant_id': id,
+        'where': 'Status=="ACTIVE"',
+        'order': 'Name ASC',
+        'include_archived': 'true'
+    }
+
+    try:
+        api_response = accounting_api.get_tracking_categories(**params).to_dict()
+        master = api_response['tracking_categories'][0]
+        categories = {}
+        categories[master['tracking_category_id']] = {trk['name']:trk['tracking_option_id'] for trk in master['options']}
+    except AccountingBadRequestException as e:
+        categories = {}
+        print(
+            "Exception when calling AccountingApi->getTrackingCategories: %s\n"
+            % e)
+
+    # with open(f'cats_{hotel}.json', 'w') as fp:
+    #     json.dump(categories, fp, indent=4)
+
+    return categories
+
+
+@xero_token_required
+def get_accounts(hotel, id):
+    accounting_api = AccountingApi(api_client)
+    params = {
+        'xero_tenant_id': id,
+        'where': 'Status=="ACTIVE"',
+        'order': 'Name ASC',
+    }
+
+    try:
+        api_response = serialize(accounting_api.get_accounts(**params))
+    except AccountingBadRequestException as e:
+        api_response = ''
+        print(
+            "Exception when calling AccountingApi->getTrackingCategories: %s\n"
+            % e)
+
+    accts_df = pd.DataFrame(api_response['Accounts'])
+    # accts_df.to_csv(f'accounts_{hotel}.csv', index=False)
+
+    return accts_df
+
+
+
+@app.route("/net-income")
+@xero_token_required
+def get_net_income():
+    hotels = pd.read_csv('tenants1.csv')
+    accounting_api = AccountingApi(api_client)
+    hotel_trans = []
+    for _, hotel in hotels.iterrows():
+        params = {
+                'xero_tenant_id': hotel['tenant_id'],
+                'from_date': dateutil.parser.parse("2021-12-01"),
+                'to_date': dateutil.parser.parse("2021-12-31"),
+                'timeframe': 'MONTH',
+                'standard_layout': 'True',
+                'payments_only': 'false',
+            }
+
+        # make the call
+        try:
+            api_response = accounting_api.get_report_profit_and_loss(**params)
+        except AccountingBadRequestException as e:
+            api_response = ''
+            print(
+                "Exception when calling AccountingApi->getReportProfitAndLoss: %s\n"
+                % e)
+
+        base = serialize(api_response)['Reports'][0]
+        for row in base['Rows']:
+            if subset := row.get('Rows'):
+                for r in subset:
+                    item = r.get('Cells',[{},{}])
+                    line = item[0].get('Value')
+                    value = item[1].get('Value')
+                    if line == 'Net Income':
+                        hotel_trans.append({
+                                    # 'organization_name': hotel['name'],
+                                    'org_value': value,
+                                    # 'line': line
+                                })
+    net_income_df = pd.DataFrame(hotel_trans)
+    net_income_df.to_csv('NI.csv', index=False)
+
+
+    return render_template("code.html",
+                        title="Net Income",
+                        # sub_title=report,
+                        code = net_income_df)
+                        # code=json.dumps(base, indent=4))
+
+@app.route("/p-and-l")
+@xero_token_required
+def get_p_and_l():
+    # create API instance
+    accounting_api = AccountingApi(api_client)
+
+    # run tenants function to get app connections
+    # tenants()
+    hotels = pd.read_csv('tenants.csv')
+
+    all_hotels_df = pd.DataFrame(
+            {
+            'organization_name': [],
+            'tracking_category_1': [],
+            'org_value': [],
+            'org_currency': [],
+            'group_currency': [],
+            'group_value': [],
+            'tracking_category_2': [],
+            'period': [],
+            'actual_or_budget': [],
+            'timestamp': []
+        })
+
+
+    for _, hotel in hotels.iterrows():
+        categories = get_tracking_categories(hotel['name'], hotel['tenant_id'])
+        accounts_df = get_accounts(hotel['name'], hotel['tenant_id'])
+        if accounts_df.shape[0]>0:
+            cols = [
+                "AccountID",
+                "Name",
+                "ReportingCode",
+                "Type",
+                "Description",
+                "ReportingCodeName",
+                "Code"]
+            new_accts_cols = {"Code": 'account_code', "Name": "account",
+                              "Type": "type", "ReportingCode": 'reporting_code',
+                              "ReportingCodeName": "reporting_name","Description":"description"}
+            accounts_df = accounts_df[cols].rename(columns=new_accts_cols)
+            accounts_df['AccountID'] = accounts_df['AccountID'].astype(str)
+            # accounts_df.to_csv(f'{hotel["name"]}_updated_acct.csv', index=False)
+        # get tracking options category id **check if all props share the same to hardcode**
+        id = list(categories.keys())[0]
+
+        # loop through api call for each tracking
+        hotel_trans = []
+        for k, v in categories.get(id,{}).items():
+            params = {
+                'xero_tenant_id': hotel['tenant_id'],
+                'from_date': dateutil.parser.parse("2021-12-01"),
+                'to_date': dateutil.parser.parse("2021-12-31"),
+                'timeframe': 'MONTH',
+                'standard_layout': 'True',
+                'payments_only': 'false',
+                'tracking_category_id':  id,
+                # 'tracking_category_id_2': '00000000-0000-0000-0000-000000000000',
+                'tracking_option_id': v,
+                # 'tracking_option_id_2': '00000000-0000-0000-0000-000000000000'
+            }
+
+            # make the call
+            try:
+                api_response = accounting_api.get_report_profit_and_loss(**params)
+            except AccountingBadRequestException as e:
+                api_response = ''
+                print(
+                    "Exception when calling AccountingApi->getReportProfitAndLoss: %s\n"
+                    % e)
+
+            # convert response to json
+            base = serialize(api_response)['Reports'][0]
+
+            # report = ' - '.join(base['ReportTitles'])
+            # pull needed nested info
+            for row in base['Rows']:
+                if subset := row.get('Rows'):
+                    for r in subset:
+                        item = r.get('Cells',[{},{}])
+                        line = item[0].get('Value')
+                        value = item[1].get('Value')
+                        acct = item[0].get('Attributes',[{}])[0].get('Value')
+                        if acct:
+                            hotel_trans.append({
+                                'organization_name': hotel['name'],
+                                'tracking_category_1': k,
+                                'AccountID': acct,
+                                'org_value': value
+                            })
+        hotel_df = pd.DataFrame(hotel_trans)
+        if hotel_df.shape[0] > 0 and accounts_df.shape[0] > 0:
+            hotel_df['AccountID'] = hotel_df['AccountID'].astype(str)
+            hotel_combo_df = accounts_df.merge(hotel_df,
+                                               on='AccountID',
+                                               how='right').drop(columns='AccountID')
+            hotel_combo_df['org_currency'] = hotel['currency']
+            hotel_combo_df['group_currency'] = hotel_combo_df['org_currency']
+            hotel_combo_df['group_value'] = hotel_combo_df['org_value']
+            hotel_combo_df['tracking_category_2'] = 'Unassigned'
+            hotel_combo_df['period'] = pd.to_datetime('2021-12-31', utc=True)
+            hotel_combo_df['actual_or_budget'] = 'Actual'
+            hotel_combo_df['timestamp'] = pd.to_datetime('today', utc=True)
+            hotel_combo_df['description'].fillna(' ', inplace=True)
+
+            # hotel_combo_df.to_csv(f'{hotel["name"]}_trans.csv', index=False)
+            all_hotels_df = pd.concat([all_hotels_df, hotel_combo_df])
+    pd.set_option("display.max_rows", 10_000)
+    pd.set_option("display.max_columns", 30)
+    all_hotels_df.reset_index(inplace=True, drop=True)
+    all_hotels_df.to_csv('all_hotels.csv', index=False)
+
+    return render_template("code.html",
+                            title="P&L",
+                            # sub_title=report,
+                            code=all_hotels_df)
+
+
 if __name__ == '__main__':
-    app.run(host='localhost', port=5000)
+    app.run(host='localhost', port=8000)
